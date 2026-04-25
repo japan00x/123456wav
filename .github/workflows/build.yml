@@ -1,29 +1,25 @@
-name: Rhythm Convert OtoMAD
-
+name: rhythm-convert
 on:
-  push:
-    branches:
-      - main
   workflow_dispatch:
-
 jobs:
-  build:
+  convert:
     runs-on: ubuntu-latest
-
     steps:
-      - uses: actions/checkout@v3
-
-      - uses: actions/setup-python@v4
+      - uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
-
-      - run: sudo apt-get update && sudo apt-get install -y ffmpeg libsndfile1
-
-      - run: pip install librosa numpy soundfile pretty_midi scipy
-
-      - run: python convert.py
-
-      - uses: actions/upload-artifact@v3
-        with:
-          name: mad-output
-          path: mad_output.wav
+          python-version: '3.12'
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg build-essential
+          pip install numpy scipy librosa soundfile pretty_midi pyworld
+      - name: Run conversion
+        run: python convert.py
+      - name: Commit and push
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add mad.wav
+          git diff --cached --quiet || (git commit -m "Update mad.wav with rhythm convert" && git push)
