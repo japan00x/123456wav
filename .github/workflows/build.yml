@@ -6,12 +6,17 @@ on:
       - 'mad.wav'
       - 'original.midi'
   workflow_dispatch:
+permissions:
+  contents: write
 jobs:
   convert:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          persist-credentials: true
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
