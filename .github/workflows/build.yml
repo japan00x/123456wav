@@ -1,27 +1,31 @@
 name: rhythm-convert
 on:
+  push:
+    paths:
+      - 'original.wav'
+      - 'mad.wav'
+      - 'original.midi'
   workflow_dispatch:
 jobs:
   convert:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Setup Python
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: '3.11'
       - name: Install dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg build-essential
-          pip install --upgrade pip setuptools wheel
-          pip install "setuptools<82"
-          pip install numpy scipy librosa soundfile pretty_midi pyworld
-      - name: Run conversion
+          pip install librosa soundfile pyyaml pretty-midi numpy
+      - name: Run convert.py
         run: python convert.py
-      - name: Commit and push
+      - name: Commit converted files
+        if: success()
         run: |
-          git config --global user.name 'github-actions[bot]'
-          git config --global user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add mad.wav
-          git diff --cached --quiet || (git commit -m "Update mad.wav with rhythm convert" && git push)
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          git add mad_converted.wav analysis.json
+          git commit -m "rhythm-convert: mad.wav を original.wav のメロディライン・音階・長さに完全一致変換" || exit 0
+          git push
