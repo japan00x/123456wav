@@ -15,6 +15,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ffmpeg build-essential
           pip install --upgrade pip setuptools wheel
+          pip install "setuptools<82"
           pip install numpy scipy librosa soundfile pretty_midi pyworld
       - name: Run conversion
         run: python convert.py
