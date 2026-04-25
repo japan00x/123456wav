@@ -1,104 +1,51 @@
-import librosa
-import numpy as np
-import soundfile as sf
-import pretty_midi
-import sys
 import os
-
-def loop_pad(audio, sr, target_duration):
-    target_len = int(target_duration * sr)
-    if len(audio) >= target_len:
-        return audio[:target_len]
-    repeats = (target_len // len(audio)) + 1
-    return np.tile(audio, repeats)[:target_len]
-
-def get_base_midi(audio, sr):
-    f0, _, _ = librosa.pyin(audio, fmin=librosa.note_to_hz('C2'), fmax=librosa.note_to_hz('C7'))
-    f0 = f0[~np.isnan(f0)]
-    if len(f0) == 0:
-        return 60.0
-    return librosa.hz_to_midi(np.median(f0))
-
-def process_from_midi(mad_audio, sr, midi_file, target_duration):
-    midi_data = pretty_midi.PrettyMIDI(midi_file)
-    out_audio = np.zeros(int(target_duration * sr))
-    mad_base = get_base_midi(mad_audio, sr)
-    
-    for instrument in midi_data.instruments:
-        if instrument.is_drum:
-            continue
-        for note in instrument.notes:
-            start_sample = int(note.start * sr)
-            end_sample = int(note.end * sr)
-            if start_sample >= len(out_audio):
-                continue
-            end_sample = min(end_sample, len(out_audio))
-            
-            note_dur = (end_sample - start_sample) / sr
-            slice_audio = loop_pad(mad_audio, sr, note_dur)
-            
-            n_steps = note.pitch - mad_base
-            shifted = librosa.effects.pitch_shift(y=slice_audio, sr=sr, n_steps=n_steps)
-            
-            velocity_scale = note.velocity / 127.0
-            out_audio[start_sample:end_sample] += shifted[:end_sample-start_sample] * velocity_scale
-            
-    return out_audio
-
-def process_from_wav(mad_audio, sr, orig_audio, orig_sr):
-    if sr != orig_sr:
-        orig_audio = librosa.resample(y=orig_audio, orig_sr=orig_sr, target_sr=sr)
-    target_duration = len(orig_audio) / sr
-    looped_mad = loop_pad(mad_audio, sr, target_duration)
-    
-    mad_base = get_base_midi(mad_audio, sr)
-    
-    onset_env = librosa.onset.onset_strength(y=orig_audio, sr=sr)
-    onsets = librosa.onset.onset_detect(onset_envelope=onset_env, sr=sr, units='samples')
-    onsets = np.append(onsets, len(orig_audio))
-    
-    out_audio = np.zeros_like(looped_mad)
-    
-    for i in range(len(onsets) - 1):
-        start = onsets[i]
-        end = onsets[i+1]
-        segment_orig = orig_audio[start:end]
-        
-        f0, _, _ = librosa.pyin(segment_orig, fmin=librosa.note_to_hz('C2'), fmax=librosa.note_to_hz('C7'))
-        f0_valid = f0[~np.isnan(f0)]
-        
-        segment_mad = looped_mad[start:end]
-        
-        if len(f0_valid) > 0:
-            target_midi = librosa.hz_to_midi(np.median(f0_valid))
-            n_steps = target_midi - mad_base
-            shifted = librosa.effects.pitch_shift(y=segment_mad, sr=sr, n_steps=n_steps)
-            out_audio[start:end] = shifted
-        else:
-            out_audio[start:end] = segment_mad
-            
-    return out_audio
-
+import numpy as np
+import librosa
+import soundfile as sf
+import pyworld as pw
+from pretty_midi import PrettyMIDI
 def main():
-    mad_path = 'mad.wav'
-    orig_path = 'original.wav'
-    midi_path = 'original.midi'
-    out_path = 'mad_output.wav'
-
-    if not os.path.exists(mad_path) or not os.path.exists(orig_path):
-        sys.exit(1)
-
-    mad_audio, sr = librosa.load(mad_path, sr=None)
-    orig_audio, orig_sr = librosa.load(orig_path, sr=None)
-    target_duration = len(orig_audio) / orig_sr
-
-    if os.path.exists(midi_path):
-        result = process_from_midi(mad_audio, sr, midi_path, target_duration)
+    original_wav_path = "original.wav"
+    mad_wav_path = "mad.wav"
+    original_midi_path = "original.midi"
+    output_wav_path = "mad.wav"
+    y_orig, sr = librosa.load(original_wav_path, sr=None)
+    dur_orig = librosa.get_duration(y=y_orig, sr=sr)
+    y_mad, sr_mad = librosa.load(mad_wav_path, sr=None)
+    dur_mad = librosa.get_duration(y=y_mad, sr=sr_mad)
+    if sr_mad != sr:
+        y_mad = librosa.resample(y=y_mad, orig_sr=sr_mad, target_sr=sr)
+    if dur_mad < dur_orig:
+        diff = dur_orig - dur_mad
+        prefix_len = int(diff * sr)
+        prefix = y_mad[:prefix_len]
+        y_mad = np.concatenate((y_mad, prefix))
+    elif dur_mad > dur_orig:
+        trim_len = int(dur_orig * sr)
+        y_mad = y_mad[:trim_len]
+    frame_period = 5.0
+    f0_mad, sp_mad, ap_mad = pw.wav2world(y_mad, sr, f0_floor=71.0, f0_ceil=800.0, frame_period=frame_period)
+    n_frames = len(f0_mad)
+    hop_time = frame_period / 1000.0
+    times = np.arange(n_frames) * hop_time
+    if os.path.exists(original_midi_path):
+        midi_data = PrettyMIDI(original_midi_path)
+        f0_converted = np.zeros(n_frames)
+        for instrument in midi_data.instruments:
+            for note in instrument.notes:
+                start = note.start
+                end = note.end
+                pitch_hz = librosa.midi_to_hz(note.pitch)
+                mask = (times >= start) & (times < end)
+                f0_converted[mask] = pitch_hz
     else:
-        result = process_from_wav(mad_audio, sr, orig_audio, orig_sr)
-        
-    result = librosa.util.normalize(result)
-    sf.write(out_path, result, sr)
-
-if __name__ == '__main__':
+        f0_orig, _ = pw.harvest(y_orig, sr, f0_floor=71.0, f0_ceil=800.0, frame_period=frame_period)
+        f0_converted = f0_orig.copy()
+    y_converted = pw.synthesize(f0_converted, sp_mad, ap_mad, sr)
+    rms_orig = np.sqrt(np.mean(y_orig ** 2))
+    rms_mad = np.sqrt(np.mean(y_converted ** 2))
+    if rms_mad > 0:
+        y_converted *= (rms_orig / rms_mad)
+    sf.write(output_wav_path, y_converted, sr)
+if __name__ == "__main__":
     main()
