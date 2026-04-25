@@ -1,0 +1,272 @@
+name: rhythm-convert
+
+on:
+  push:
+    paths:
+      - original.wav
+      - mad.wav
+      - convert.py
+      - .github/workflows/rhythm-convert.yml
+  workflow_dispatch:
+    inputs:
+      original:
+        description: "path to original wav"
+        required: false
+        default: "original.wav"
+      mad:
+        description: "path to mad wav"
+        required: false
+        default: "mad.wav"
+      output:
+        description: "output filename"
+        required: false
+        default: "output.wav"
+
+env:
+  PYTHON_VERSION: "3.11"
+  ORIGINAL_WAV: ${{ github.event.inputs.original || 'original.wav' }}
+  MAD_WAV: ${{ github.event.inputs.mad || 'mad.wav' }}
+  OUTPUT_WAV: ${{ github.event.inputs.output || 'output.wav' }}
+
+jobs:
+  convert:
+    name: Spectral Pitch Conversion
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          lfs: true
+
+      - name: Verify input files exist
+        run: |
+          if [ ! -f "$ORIGINAL_WAV" ]; then
+            echo "::error::original wav not found: $ORIGINAL_WAV"
+            exit 1
+          fi
+          if [ ! -f "$MAD_WAV" ]; then
+            echo "::error::mad wav not found: $MAD_WAV"
+            exit 1
+          fi
+          if [ ! -f "convert.py" ]; then
+            echo "::error::convert.py not found in repository root"
+            exit 1
+          fi
+          echo "original: $(du -h $ORIGINAL_WAV | cut -f1) $(file $ORIGINAL_WAV)"
+          echo "mad:      $(du -h $MAD_WAV | cut -f1) $(file $MAD_WAV)"
+
+      - name: Install system audio libraries
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libsndfile1 \
+            libsndfile1-dev \
+            ffmpeg \
+            libavcodec-dev \
+            libavformat-dev \
+            libavutil-dev \
+            libswresample-dev \
+            libfftw3-dev \
+            libblas-dev \
+            liblapack-dev \
+            libopenblas-dev
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip wheel setuptools
+          pip install \
+            "numpy>=1.24.0,<2.0.0" \
+            "scipy>=1.11.0" \
+            "librosa>=0.10.1" \
+            "soundfile>=0.12.1" \
+            "numba>=0.58.0" \
+            "resampy>=0.4.2" \
+            "soxr>=0.3.6" \
+            "audioread>=3.0.0" \
+            "scikit-learn>=1.3.0" \
+            "joblib>=1.3.0"
+
+      - name: Validate wav integrity
+        run: |
+          python - <<'PYEOF'
+          import soundfile as sf
+          import sys
+
+          def check_wav(path, label):
+              try:
+                  info = sf.info(path)
+                  print(f"{label}:")
+                  print(f"  samplerate : {info.samplerate} Hz")
+                  print(f"  channels   : {info.channels}")
+                  print(f"  frames     : {info.frames}")
+                  print(f"  duration   : {info.frames / info.samplerate:.4f} s")
+                  print(f"  format     : {info.format} / {info.subtype}")
+                  if info.frames == 0:
+                      print(f"  WARNING: {path} has 0 frames")
+                      sys.exit(1)
+              except Exception as e:
+                  print(f"ERROR reading {path}: {e}")
+                  sys.exit(1)
+
+          import os
+          check_wav(os.environ["ORIGINAL_WAV"], "original")
+          check_wav(os.environ["MAD_WAV"], "mad")
+          PYEOF
+
+      - name: Analyse spectral / pitch structure
+        run: |
+          python - <<'PYEOF'
+          import os
+          import warnings
+          import numpy as np
+          import librosa
+          warnings.filterwarnings("ignore")
+
+          ORIGINAL_WAV = os.environ["ORIGINAL_WAV"]
+          MAD_WAV = os.environ["MAD_WAV"]
+          HOP = 256
+          FMIN = librosa.note_to_hz("C2")
+          FMAX = librosa.note_to_hz("C7")
+
+          def summarise(path, label):
+              y, sr = librosa.load(path, sr=None, mono=True)
+              duration = len(y) / sr
+              f0, voiced_flag, voiced_probs = librosa.pyin(
+                  y, fmin=FMIN, fmax=FMAX, sr=sr, hop_length=HOP
+              )
+              voiced_probs = np.nan_to_num(voiced_probs, nan=0.0)
+              reliable = voiced_flag & (voiced_probs >= 0.4)
+              valid_f0 = f0[reliable & ~np.isnan(f0)]
+
+              tempo_arr, _ = librosa.beat.beat_track(y=y, sr=sr, hop_length=HOP)
+              tempo = float(np.mean(tempo_arr))
+
+              rms = librosa.feature.rms(y=y, frame_length=2048, hop_length=HOP)[0]
+              centroid = librosa.feature.spectral_centroid(y=y, sr=sr, hop_length=HOP)[0]
+              zcr = librosa.feature.zero_crossing_rate(y, frame_length=1024, hop_length=HOP)[0]
+
+              note_names = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
+              if len(valid_f0) > 0:
+                  midi_notes = 12.0 * np.log2(valid_f0 / 440.0) + 69.0
+                  pc_hist = np.bincount((np.round(midi_notes % 12).astype(int)) % 12, minlength=12)
+                  pc_norm = pc_hist / (pc_hist.sum() + 1e-9)
+                  major_t = np.array([1,0,1,0,1,1,0,1,0,1,0,1], float)
+                  minor_t = np.array([1,0,1,1,0,1,0,1,1,0,1,0], float)
+                  best_score, best_root, best_mode = -1, 0, "major"
+                  for root in range(12):
+                      for tmpl, mode in [(major_t, "major"), (minor_t, "minor")]:
+                          score = np.dot(pc_norm, np.roll(tmpl, root))
+                          if score > best_score:
+                              best_score, best_root, best_mode = score, root, mode
+                  scale = f"{note_names[best_root]} {best_mode}"
+                  median_midi = float(np.median(midi_notes))
+                  median_note = note_names[int(round(median_midi)) % 12]
+                  median_octave = int(median_midi / 12) - 1
+              else:
+                  scale = "unknown"
+                  median_note = "?"
+                  median_octave = 0
+
+              print(f"=== {label} ({path}) ===")
+              print(f"  duration        : {duration:.4f} s")
+              print(f"  sample_rate     : {sr} Hz")
+              print(f"  samples         : {len(y)}")
+              print(f"  tempo           : {tempo:.2f} bpm")
+              print(f"  scale           : {scale}")
+              print(f"  median_pitch    : {median_note}{median_octave}")
+              print(f"  voiced_ratio    : {np.mean(reliable):.4f}")
+              print(f"  rms_mean        : {np.mean(rms):.6f}")
+              print(f"  rms_peak        : {np.max(rms):.6f}")
+              print(f"  spec_centroid   : {np.mean(centroid):.2f} Hz")
+              print(f"  zero_cross_rate : {np.mean(zcr):.6f}")
+              if len(valid_f0) > 0:
+                  print(f"  f0_median       : {np.median(valid_f0):.2f} Hz")
+                  print(f"  f0_min          : {np.min(valid_f0):.2f} Hz")
+                  print(f"  f0_max          : {np.max(valid_f0):.2f} Hz")
+              print()
+
+          summarise(ORIGINAL_WAV, "ORIGINAL")
+          summarise(MAD_WAV, "MAD")
+          PYEOF
+
+      - name: Run pitch conversion with loop interpolation
+        run: |
+          python convert.py "$ORIGINAL_WAV" "$MAD_WAV" "$OUTPUT_WAV"
+
+      - name: Validate output wav
+        run: |
+          python - <<'PYEOF'
+          import os
+          import numpy as np
+          import soundfile as sf
+          import librosa
+
+          OUTPUT_WAV = os.environ["OUTPUT_WAV"]
+          ORIGINAL_WAV = os.environ["ORIGINAL_WAV"]
+
+          y_out, sr_out = librosa.load(OUTPUT_WAV, sr=None, mono=True)
+          y_orig, sr_orig = librosa.load(ORIGINAL_WAV, sr=None, mono=True)
+
+          info = sf.info(OUTPUT_WAV)
+          orig_dur = len(y_orig) / sr_orig
+          out_dur = len(y_out) / sr_out
+
+          print("=== OUTPUT VALIDATION ===")
+          print(f"  path            : {OUTPUT_WAV}")
+          print(f"  format          : {info.format} / {info.subtype}")
+          print(f"  sample_rate     : {sr_out} Hz")
+          print(f"  duration        : {out_dur:.4f} s")
+          print(f"  original_dur    : {orig_dur:.4f} s")
+          print(f"  duration_match  : {abs(out_dur - orig_dur) < 0.1}")
+          print(f"  peak_amplitude  : {np.max(np.abs(y_out)):.6f}")
+          print(f"  rms             : {np.sqrt(np.mean(y_out**2)):.6f}")
+
+          has_clipping = np.any(np.abs(y_out) > 0.999)
+          has_silence = np.sqrt(np.mean(y_out**2)) < 1e-5
+          has_nan = np.any(np.isnan(y_out))
+          has_inf = np.any(np.isinf(y_out))
+
+          if has_clipping:
+              print("  WARNING: clipping detected in output")
+          if has_silence:
+              print("  ERROR: output is silent")
+              raise SystemExit(1)
+          if has_nan:
+              print("  ERROR: NaN values in output")
+              raise SystemExit(1)
+          if has_inf:
+              print("  ERROR: Inf values in output")
+              raise SystemExit(1)
+
+          print("  status          : OK")
+          PYEOF
+
+      - name: Upload converted audio artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rhythm-converted-${{ github.sha }}
+          path: ${{ env.OUTPUT_WAV }}
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Commit output to repository
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "$OUTPUT_WAV"
+          if git diff --cached --quiet; then
+            echo "no changes to commit"
+          else
+            git commit -m "chore: rhythm-convert output [skip ci]"
+            git push
+          fi
